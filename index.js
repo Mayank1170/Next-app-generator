@@ -7,38 +7,46 @@ import fs from 'fs-extra';
 import path from 'path';
 import ora from 'ora';
 import OpenAI from 'openai';
-import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
 
-dotenv.config();
-
-const openai = new OpenAI({
-  apiKey: process.env.XAI_API_KEY,
-  baseURL: "https://api.x.ai/v1",
-});
+const currentDir = process.cwd();
 
 program
   .version('1.0.0')
   .argument('<project-name>', 'Name of the Next.js project')
   .argument('<description>', 'Description of your project and desired components')
+  .requiredOption('--api-key <key>', 'Your X.AI API key') 
   .option('--theme <theme>', 'Theme color scheme (default: "modern")', 'modern')
   .option('--style <style>', 'Design style (default: "minimal")', 'minimal')
   .action(async (projectName, description, options) => {
     const spinner = ora('Creating your custom Next.js application...').start();
     
     try {
+      const openai = new OpenAI({
+        apiKey: options.apiKey,  
+        baseURL: "https://api.x.ai/v1"
+      });
+
+      const projectPath = path.join(currentDir, projectName);
+      
+      if (fs.existsSync(projectPath)) {
+        throw new Error(`Directory ${projectName} already exists. Please choose a different name or delete the existing directory.`);
+      }
+
       spinner.text = 'Installing Next.js application...';
       execSync(`npx create-next-app@latest ${projectName} --typescript --tailwind --eslint`, {
-        stdio: 'inherit'
+        stdio: 'inherit',
+        cwd: currentDir
       });
 
       spinner.text = 'Analyzing project requirements...';
-      const projectPlan = await analyzeProjectRequirements(description, options);
+      const projectPlan = await analyzeProject(description, options, openai);
 
       spinner.text = 'Creating project structure...';
-      await createProjectStructure(projectName, projectPlan);
+      await createProjectStructure(projectPath, projectPlan);
 
       spinner.text = 'Generating components...';
-      await generateComponents(projectName, projectPlan);
+      await generateComponents(projectPath, projectPlan, openai);
 
       spinner.succeed(chalk.green('🚀 Your custom Next.js application is ready!'));
       
@@ -54,21 +62,23 @@ program
 
 program.parse(process.argv);
 
-async function analyzeProjectRequirements(description, options) {
+async function analyzeProject(description, options, openai) {
   const prompt = `
-As a senior Next.js developer, analyze the following project description and create a detailed project structure.
+Analyze this Next.js project and return a JSON object. The response should be a raw JSON object without any markdown formatting, backticks, or explanation.
+
+Project details:
 Description: "${description}"
 Theme: ${options.theme}
 Style: ${options.style}
 
-Return a raw JSON object without any markdown formatting or backticks, in exactly this format:
+Return this exact JSON structure (fill in appropriate values):
 {
   "components": [
     {
       "name": "ComponentName",
       "type": "section/layout/feature",
       "description": "Detailed description of the component",
-      "props": ["Fprop1", "prop2"],
+      "props": ["prop1", "prop2"],
       "dependencies": ["dep1", "dep2"]
     }
   ],
@@ -81,31 +91,29 @@ Return a raw JSON object without any markdown formatting or backticks, in exactl
   ],
   "features": ["feature1", "feature2"],
   "dataStructures": ["type1", "type2"]
-}
-
-Make sure to return only valid JSON without any additional text or explanation.`;
+}`;
 
   const completion = await openai.chat.completions.create({
     model: "grok-2-1212",
     messages: [
-      { role: "system", content: "You are an expert Next.js developer. Respond with valid JSON only." },
+      { role: "system", content: "You are an expert Next.js developer. Return a JSON object without any backticks, markdown formatting, or explanation." },
       { role: "user", content: prompt }
-    ]
+    ],
+    temperature: 0
   });
 
   const content = completion.choices[0].message.content;
+  let cleanContent = content.replace(/```json\n?|```\n?/g, '').trim();
+  
   try {
-    const cleanContent = content.replace(/```json\n?|```\n?/g, '').trim();
     return JSON.parse(cleanContent);
   } catch (error) {
     console.error('Failed to parse JSON:', cleanContent);
-    throw new Error('Failed to parse project requirements');
+    throw new Error(`Failed to parse project requirements: ${error.message}`);
   }
 }
 
-async function createProjectStructure(projectName, projectPlan) {
-  const baseDir = path.join(process.cwd(), projectName);
-  
+async function createProjectStructure(projectPath, projectPlan) {
   const directories = [
     'components',
     'components/ui',
@@ -120,15 +128,11 @@ async function createProjectStructure(projectName, projectPlan) {
   ];
 
   for (const dir of directories) {
-    await fs.ensureDir(path.join(baseDir, dir));
-  }
-
-  if (projectPlan.dataStructures?.length > 0) {
-    await generateTypeDefinitions(baseDir, projectPlan.dataStructures);
+    await fs.ensureDir(path.join(projectPath, dir));
   }
 }
 
-async function generateComponents(projectName, projectPlan) {
+async function generateComponents(projectPath, projectPlan, openai) {
   for (const component of projectPlan.components) {
     const prompt = `
 Create a modern, responsive Next.js component with the following specifications:
@@ -156,38 +160,12 @@ Provide only the component code without any explanation.`;
       ]
     });
 
-    const componentCode = completion.choices[0].message.content;
+    const componentCode = completion.choices[0].message.content.replace(/```tsx?\n?|```\n?/g, '').trim();
     const componentDir = getComponentDirectory(component.type);
-    const componentPath = path.join(process.cwd(), projectName, 'components', componentDir, `${component.name}.tsx`);
+    const componentPath = path.join(projectPath, 'components', componentDir, `${component.name}.tsx`);
     
     await fs.writeFile(componentPath, componentCode);
   }
-}
-
-async function generateTypeDefinitions(baseDir, dataStructures) {
-  const prompt = `
-Create TypeScript type definitions for the following data structures:
-${JSON.stringify(dataStructures)}
-
-Include:
-- Interfaces
-- Type aliases
-- Proper JSDoc comments
-- Validation decorators (if needed)
-- Utility types
-
-Provide only the type definitions without any explanation.`;
-
-  const completion = await openai.chat.completions.create({
-    model: "grok-2-1212",
-    messages: [
-      { role: "system", content: "You are an expert TypeScript developer. Provide only the type definitions without any explanation." },
-      { role: "user", content: prompt }
-    ]
-  });
-
-  const typeDefinitions = completion.choices[0].message.content;
-  await fs.writeFile(path.join(baseDir, 'types', 'index.ts'), typeDefinitions);
 }
 
 function getComponentDirectory(type) {
